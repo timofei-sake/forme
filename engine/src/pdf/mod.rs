@@ -130,6 +130,59 @@ struct PdfBuilder {
     shading_map: HashMap<(usize, usize), (usize, String)>,
 }
 
+/// How one element takes part in the per-page draw-order walk.
+///
+/// `image_index_map` and `shading_map` are keyed by ordinals handed out
+/// while the PDF objects are registered, and looked up again while the
+/// page content stream is emitted. The registration walk and the emission
+/// walk therefore have to step in lockstep: an element kind that consumes
+/// an ordinal in one walk but not the other shifts every later lookup on
+/// that page, so its image comes out drawn with the wrong XObject — or,
+/// past the end of the map, not drawn at all. Both walks derive their
+/// stepping from `draw_walk` so they cannot drift apart.
+#[derive(Clone, Copy)]
+struct DrawWalk {
+    /// Consumes one element ordinal — the key of `image_index_map`.
+    consumes_element_ordinal: bool,
+    /// Consumes one gradient ordinal — the key of `shading_map`.
+    consumes_gradient_ordinal: bool,
+    /// The walk descends into this element's children.
+    descends_into_children: bool,
+}
+
+/// The single source of truth for draw-order stepping. See [`DrawWalk`].
+fn draw_walk(draw: &DrawCommand) -> DrawWalk {
+    let (consumes_element_ordinal, descends_into_children) = match draw {
+        // Leaf paints that own an element ordinal. Images consume one to
+        // address their XObject; the vector kinds consume one so that the
+        // ordinals stay a plain draw-order position rather than an
+        // image-only count.
+        DrawCommand::Image { .. }
+        | DrawCommand::ImagePlaceholder
+        | DrawCommand::Barcode { .. }
+        | DrawCommand::QrCode { .. }
+        | DrawCommand::Chart { .. } => (true, false),
+        // Leaf paints that draw their own contents and stop.
+        DrawCommand::Svg { .. } | DrawCommand::Watermark { .. } => (false, false),
+        // Containers: no ordinal of their own, children are walked.
+        DrawCommand::None
+        | DrawCommand::Rect { .. }
+        | DrawCommand::Text { .. }
+        | DrawCommand::FormField { .. } => (false, true),
+    };
+    DrawWalk {
+        consumes_element_ordinal,
+        consumes_gradient_ordinal: matches!(
+            draw,
+            DrawCommand::Rect {
+                background_gradient: Some(_),
+                ..
+            }
+        ),
+        descends_into_children,
+    }
+}
+
 pub(crate) struct PdfObject {
     #[allow(dead_code)]
     pub(crate) id: usize,
@@ -1260,6 +1313,18 @@ impl PdfWriter {
             let _ = writeln!(stream, "1 0 0 1 {:.4} {:.4} cm", origin_x, origin_y);
         }
 
+        // Take this element's draw-order ordinals before painting anything,
+        // using the same stepping the registration walk used. See `DrawWalk`.
+        let walk = draw_walk(&element.draw);
+        let elem_idx = *element_counter;
+        if walk.consumes_element_ordinal {
+            *element_counter += 1;
+        }
+        let gradient_idx = *gradient_counter;
+        if walk.consumes_gradient_ordinal {
+            *gradient_counter += 1;
+        }
+
         match &element.draw {
             DrawCommand::None => {}
 
@@ -1334,8 +1399,7 @@ impl PdfWriter {
                 // the shading's local 0,0 to the rect's bottom-left so
                 // the Coords (computed during register_shadings) line up.
                 if background_gradient.is_some() {
-                    let key = (page_idx, *gradient_counter);
-                    *gradient_counter += 1;
+                    let key = (page_idx, gradient_idx);
                     if let Some((_, sh_name)) = builder.shading_map.get(&key) {
                         let _ = writeln!(stream, "q");
                         // Clip to the rect (rounded if borderRadius set).
@@ -1625,8 +1689,6 @@ impl PdfWriter {
             }
 
             DrawCommand::Image { .. } => {
-                let elem_idx = *element_counter;
-                *element_counter += 1;
                 if let Some(&img_idx) = builder.image_index_map.get(&(page_idx, elem_idx)) {
                     let x = element.x;
                     let y = page_height - element.y - element.height;
@@ -1657,7 +1719,6 @@ impl PdfWriter {
             }
 
             DrawCommand::ImagePlaceholder => {
-                *element_counter += 1;
                 let x = element.x;
                 let y = page_height - element.y - element.height;
                 let _ = write!(
@@ -1749,7 +1810,6 @@ impl PdfWriter {
                 height,
                 color,
             } => {
-                *element_counter += 1;
                 let _ = writeln!(stream, "q");
                 let _ = writeln!(stream, "{:.3} {:.3} {:.3} rg", color.r, color.g, color.b);
                 for (i, &bar) in bars.iter().enumerate() {
@@ -1780,7 +1840,6 @@ impl PdfWriter {
                 module_size,
                 color,
             } => {
-                *element_counter += 1;
                 let _ = writeln!(stream, "q");
                 let _ = writeln!(stream, "{:.3} {:.3} {:.3} rg", color.r, color.g, color.b);
                 for (row_idx, row) in modules.iter().enumerate() {
@@ -1809,7 +1868,6 @@ impl PdfWriter {
             }
 
             DrawCommand::Chart { primitives } => {
-                *element_counter += 1;
                 let _ = writeln!(stream, "q");
                 // Set up coordinate transform: Y-flip so chart primitives use top-left origin
                 let _ = writeln!(
@@ -2541,11 +2599,11 @@ impl PdfWriter {
         }
     }
 
-    /// Walk all pages, create XObject PDF objects for each image,
     /// Register PDF Shading dictionaries for every Rect with a
     /// `background_gradient`. Walks the element tree once per page in
     /// pre-order (same order `write_element` recurses) so the counter-
-    /// indexed `shading_map` lookups during emission match.
+    /// indexed `shading_map` lookups during emission match — see
+    /// [`DrawWalk`].
     fn register_shadings(&self, builder: &mut PdfBuilder, pages: &[LayoutPage]) {
         for (page_idx, page) in pages.iter().enumerate() {
             let mut counter = 0usize;
@@ -2560,20 +2618,25 @@ impl PdfWriter {
         builder: &mut PdfBuilder,
     ) {
         for element in elements {
+            let walk = draw_walk(&element.draw);
+            let ordinal = *counter;
+            if walk.consumes_gradient_ordinal {
+                *counter += 1;
+            }
             if let DrawCommand::Rect {
                 background_gradient: Some(gradient),
                 ..
             } = &element.draw
             {
-                let ordinal = *counter;
-                *counter += 1;
                 let (obj_id, name) =
                     Self::write_shading_objects(builder, gradient, element, ordinal);
                 builder
                     .shading_map
                     .insert((page_idx, ordinal), (obj_id, name));
             }
-            Self::collect_shadings_recursive(&element.children, page_idx, counter, builder);
+            if walk.descends_into_children {
+                Self::collect_shadings_recursive(&element.children, page_idx, counter, builder);
+            }
         }
     }
 
@@ -2836,7 +2899,10 @@ impl PdfWriter {
         );
     }
 
-    /// and populate the image_index_map for content stream reference.
+    /// Walk all pages, create an XObject PDF object for each image, and
+    /// populate the `image_index_map` for content stream reference. The
+    /// walk steps in the same draw order `write_element` uses — see
+    /// [`DrawWalk`].
     fn register_images(&self, builder: &mut PdfBuilder, pages: &[LayoutPage]) {
         for (page_idx, page) in pages.iter().enumerate() {
             let mut element_counter = 0usize;
@@ -2851,29 +2917,26 @@ impl PdfWriter {
         builder: &mut PdfBuilder,
     ) {
         for element in elements {
-            match &element.draw {
-                DrawCommand::Image { image_data } => {
-                    let elem_idx = *element_counter;
-                    *element_counter += 1;
-
-                    let img_idx = builder.image_objects.len();
-                    let xobj_id = Self::write_image_xobject(builder, image_data);
-                    builder.image_objects.push(xobj_id);
-                    builder
-                        .image_index_map
-                        .insert((page_idx, elem_idx), img_idx);
-                }
-                DrawCommand::ImagePlaceholder => {
-                    *element_counter += 1;
-                }
-                _ => {
-                    Self::collect_images_recursive(
-                        &element.children,
-                        page_idx,
-                        element_counter,
-                        builder,
-                    );
-                }
+            let walk = draw_walk(&element.draw);
+            let elem_idx = *element_counter;
+            if walk.consumes_element_ordinal {
+                *element_counter += 1;
+            }
+            if let DrawCommand::Image { image_data } = &element.draw {
+                let img_idx = builder.image_objects.len();
+                let xobj_id = Self::write_image_xobject(builder, image_data);
+                builder.image_objects.push(xobj_id);
+                builder
+                    .image_index_map
+                    .insert((page_idx, elem_idx), img_idx);
+            }
+            if walk.descends_into_children {
+                Self::collect_images_recursive(
+                    &element.children,
+                    page_idx,
+                    element_counter,
+                    builder,
+                );
             }
         }
     }
