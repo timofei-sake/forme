@@ -10788,3 +10788,278 @@ fn test_svg_stroke_linecap_inherited_from_group() {
         streams
     );
 }
+
+// ─── Image / vector-element draw-order tests ────────────────────
+//
+// `image_index_map` is keyed by a per-page draw-order ordinal assigned
+// during registration and looked up again while the content stream is
+// emitted. Any element kind that steps the counter in one walk but not
+// the other shifts every following image reference, which is why these
+// tests interleave images with the counted vector kinds (Chart, QrCode,
+// Barcode).
+
+/// Find the first occurrence of `needle` in `hay`.
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Decompress the page content streams (and only those — image XObjects
+/// are skipped) by walking object headers and honouring each stream's
+/// `/Length`. `decompress_pdf_streams` cannot be used here: its scan
+/// re-matches the `stream\n` inside `endstream` and loses sync as soon as
+/// a document contains a binary image stream.
+fn decompress_content_streams(pdf: &[u8]) -> String {
+    const OBJ: &[u8] = b" 0 obj\n";
+    const STREAM: &[u8] = b">>\nstream\n";
+    let mut out = String::new();
+    let mut pos = 0usize;
+    while let Some(rel) = find_bytes(&pdf[pos..], OBJ) {
+        let obj_start = pos + rel + OBJ.len();
+        pos = obj_start;
+        let Some(srel) = find_bytes(&pdf[obj_start..], STREAM) else {
+            break;
+        };
+        let dict = &pdf[obj_start..obj_start + srel];
+        // The stream has to belong to this object, and must not be an image.
+        if find_bytes(dict, b"endobj").is_some() || find_bytes(dict, b"/Image").is_some() {
+            continue;
+        }
+        let Some(len) = String::from_utf8_lossy(dict)
+            .split("/Length ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let data_start = obj_start + srel + STREAM.len();
+        let Some(data) = pdf.get(data_start..data_start + len) else {
+            continue;
+        };
+        pos = data_start + len;
+        if let Ok(text) = miniz_oxide::inflate::decompress_to_vec_zlib(data) {
+            if let Ok(text) = String::from_utf8(text) {
+                out.push_str(&text);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// The `/ImN` names actually painted by a `Do` operator, in draw order.
+fn drawn_image_names(pdf: &[u8]) -> Vec<String> {
+    decompress_content_streams(pdf)
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(" Do")?.strip_prefix('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `/XObject` resource entries of every page, as `name -> object id`.
+fn xobject_resource_entries(pdf: &[u8]) -> std::collections::HashMap<String, usize> {
+    let text = String::from_utf8_lossy(pdf);
+    let mut entries = std::collections::HashMap::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("/XObject <<") {
+        let body = &rest[start + "/XObject <<".len()..];
+        let end = match body.find(">>") {
+            Some(i) => i,
+            None => break,
+        };
+        // Entries look like `/Im0 12 0 R /Im1 14 0 R`.
+        let tokens: Vec<&str> = body[..end].split_whitespace().collect();
+        for chunk in tokens.chunks(4) {
+            if let [name, id, "0", "R"] = chunk {
+                if let (Some(name), Ok(id)) = (name.strip_prefix('/'), id.parse::<usize>()) {
+                    entries.insert(name.to_string(), id);
+                }
+            }
+        }
+        rest = &body[end..];
+    }
+    entries
+}
+
+/// The dictionary head of object `obj_id` (enough to read its /Subtype,
+/// /Width and /Height without dragging in the binary stream body).
+fn object_dict_head(pdf: &[u8], obj_id: usize) -> String {
+    let header = format!("\n{} 0 obj\n", obj_id).into_bytes();
+    let Some(idx) = find_bytes(pdf, &header) else {
+        return String::new();
+    };
+    let body = &pdf[idx + header.len()..];
+    let end = find_bytes(body, b">>").map_or(body.len(), |i| i + 2);
+    String::from_utf8_lossy(&body[..end.min(512)]).into_owned()
+}
+
+/// Assert every painted `/ImN` resolves to a real `/Subtype /Image`
+/// XObject, and return the resolved dictionary heads in draw order.
+fn assert_images_painted(pdf: &[u8], expected: usize) -> Vec<String> {
+    assert_valid_pdf(pdf);
+    let drawn = drawn_image_names(pdf);
+    assert_eq!(
+        drawn.len(),
+        expected,
+        "expected {} image(s) painted, got {:?}",
+        expected,
+        drawn
+    );
+    let resources = xobject_resource_entries(pdf);
+    drawn
+        .iter()
+        .map(|name| {
+            let obj_id = resources.get(name).unwrap_or_else(|| {
+                panic!(
+                    "/{} is painted but missing from the page /XObject dict {:?}",
+                    name, resources
+                )
+            });
+            let head = object_dict_head(pdf, *obj_id);
+            assert!(
+                head.contains("/Subtype /Image"),
+                "/{} -> object {} is not an image XObject: {}",
+                name,
+                obj_id,
+                head
+            );
+            head
+        })
+        .collect()
+}
+
+fn make_bar_chart_node() -> Node {
+    Node {
+        kind: NodeKind::BarChart {
+            data: vec![
+                ChartDataPoint {
+                    label: "A".into(),
+                    value: 100.0,
+                    color: None,
+                },
+                ChartDataPoint {
+                    label: "B".into(),
+                    value: 200.0,
+                    color: None,
+                },
+            ],
+            width: 200.0,
+            height: 120.0,
+            color: None,
+            show_labels: true,
+            show_values: false,
+            show_grid: false,
+            title: None,
+        },
+        style: Style::default(),
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }
+}
+
+fn make_qrcode_node() -> Node {
+    Node {
+        kind: NodeKind::QrCode {
+            data: "https://example.com".into(),
+            size: Some(80.0),
+        },
+        style: Style::default(),
+        children: vec![],
+        id: None,
+        source_location: None,
+        bookmark: None,
+        href: None,
+        alt: None,
+    }
+}
+
+fn png_node(px: u32) -> Node {
+    let src = to_data_uri(&make_test_png(px, px), "image/png");
+    make_image_node(&src, Some(60.0), Some(60.0))
+}
+
+#[test]
+fn test_image_before_chart_draws_the_image() {
+    // Control: the ordering that always worked.
+    let doc = default_doc(vec![png_node(4), make_bar_chart_node()]);
+    assert_images_painted(&render_to_pdf(&doc), 1);
+}
+
+#[test]
+fn test_chart_before_image_draws_the_image() {
+    let doc = default_doc(vec![make_bar_chart_node(), png_node(4)]);
+    assert_images_painted(&render_to_pdf(&doc), 1);
+}
+
+#[test]
+fn test_two_charts_before_two_images_draw_both_images() {
+    // Distinct pixel sizes so a shifted lookup is visible, not just a
+    // missing one: the first painted image must be the 4px PNG.
+    let doc = default_doc(vec![
+        make_bar_chart_node(),
+        make_bar_chart_node(),
+        png_node(4),
+        png_node(8),
+    ]);
+    let heads = assert_images_painted(&render_to_pdf(&doc), 2);
+    assert!(
+        heads[0].contains("/Width 4"),
+        "first painted image should be the 4px PNG: {}",
+        heads[0]
+    );
+    assert!(
+        heads[1].contains("/Width 8"),
+        "second painted image should be the 8px PNG: {}",
+        heads[1]
+    );
+}
+
+#[test]
+fn test_images_before_charts_draw_all_images() {
+    let doc = default_doc(vec![
+        png_node(4),
+        png_node(8),
+        make_bar_chart_node(),
+        make_bar_chart_node(),
+    ]);
+    let heads = assert_images_painted(&render_to_pdf(&doc), 2);
+    assert!(heads[0].contains("/Width 4"), "{}", heads[0]);
+    assert!(heads[1].contains("/Width 8"), "{}", heads[1]);
+}
+
+#[test]
+fn test_chart_and_image_interleaved_draw_every_image() {
+    let doc = default_doc(vec![
+        make_bar_chart_node(),
+        png_node(4),
+        make_bar_chart_node(),
+        png_node(8),
+    ]);
+    let heads = assert_images_painted(&render_to_pdf(&doc), 2);
+    assert!(heads[0].contains("/Width 4"), "{}", heads[0]);
+    assert!(heads[1].contains("/Width 8"), "{}", heads[1]);
+}
+
+#[test]
+fn test_qrcode_before_image_draws_the_image() {
+    let doc = default_doc(vec![make_qrcode_node(), png_node(4)]);
+    assert_images_painted(&render_to_pdf(&doc), 1);
+}
+
+#[test]
+fn test_chart_nested_in_view_before_image_draws_the_image() {
+    // The counter is shared across nesting levels, so a chart buried in a
+    // container still has to step both walks in lockstep.
+    let doc = default_doc(vec![
+        make_view(vec![make_bar_chart_node()]),
+        make_view(vec![png_node(4)]),
+    ]);
+    assert_images_painted(&render_to_pdf(&doc), 1);
+}
